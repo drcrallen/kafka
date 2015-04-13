@@ -20,42 +20,73 @@ package org.apache.kafka.common.record;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
-
-import org.apache.kafka.common.utils.Utils;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.BitSet;
 
 import net.jpountz.lz4.LZ4Compressor;
 import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.xxhash.StreamingXXHash32;
 import net.jpountz.xxhash.XXHash32;
 import net.jpountz.xxhash.XXHashFactory;
 
 /**
- * A partial implementation of the v1.4.1 LZ4 Frame format.
- * 
- * @see <a href="https://docs.google.com/document/d/1Tdxmn5_2e5p1y4PtXkatLndWVb0R8QARJFe6JI4Keuo/edit">LZ4 Framing
- *      Format Spec</a>
+ * A partial implementation of the v1.5.0 LZ4 Frame format. This class is NOT thread safe
+ * Not Supported:
+ * * Dependent blocks
+ * * Legacy streams
+ * * Multiple frames (one KafkaLZ4BlockOutputStream is one frame)
+ *
+ * @see <a href="https://docs.google.com/document/d/1cl8N1bmkTdIpPLtnlzbBSFAdUeyNo5fwfHbHU7VRNWY">LZ4 Framing
+ *      Format Spec 1.5.0</a>
  */
 public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
 
+    protected static final int INTEGER_BYTES = Integer.SIZE >>> 3; // or Integer.BYTES in Java 1.8
+    protected static final int LONG_BYTES = Long.SIZE >>> 3; // or Long.BYTES in Java 1.8
+
     public static final int MAGIC = 0x184D2204;
-    public static final int LZ4_MAX_HEADER_LENGTH = 19;
+    public static final int LZ4_MAX_HEADER_LENGTH =
+        4 + // magic
+        1 + // FLG
+        1 + // BD
+        8 + // Content Size
+        1; // HC
     public static final int LZ4_FRAME_INCOMPRESSIBLE_MASK = 0x80000000;
+    public static final FLG.Bits[] DEFAULT_FEATURES = new FLG.Bits[]{FLG.Bits.BLOCK_INDEPENDENCE, FLG.Bits.CONTENT_CHECKSUM};
 
     public static final String CLOSED_STREAM = "The stream is already closed";
 
-    public static final int BLOCKSIZE_64KB = 4;
-    public static final int BLOCKSIZE_256KB = 5;
-    public static final int BLOCKSIZE_1MB = 6;
-    public static final int BLOCKSIZE_4MB = 7;
+    public static enum BLOCKSIZE{
+        SIZE_64KB(4), SIZE_256KB(5), SIZE_1MB(6), SIZE_4MB(7);
+        private final int indicator;
+        BLOCKSIZE(int indicator){
+            this.indicator = indicator;
+        }
+        public int getIndicator(){
+            return this.indicator;
+        }
+        public static BLOCKSIZE valueOf(int indicator){
+            switch(indicator){
+                case 7: return SIZE_4MB;
+                case 6: return SIZE_1MB;
+                case 5: return SIZE_256KB;
+                case 4: return SIZE_64KB;
+                default: throw new IllegalArgumentException(String.format("Block size must be 4-7. Cannot use value of [%d]", indicator));
+            }
+        }
+    }
 
     private final LZ4Compressor compressor;
     private final XXHash32 checksum;
-    private final FLG flg;
-    private final BD bd;
-    private final byte[] buffer;
-    private final byte[] compressedBuffer;
+    private final ByteBuffer buffer; // Buffer for uncompressed input data
+    private final byte[] compressedBuffer; // Only allocated once so it can be reused
     private final int maxBlockSize;
-    private int bufferOffset;
-    private boolean finished;
+    private final long knownSize;
+
+    private FrameInfo frameInfo = null;
+
 
     /**
      * Create a new {@link OutputStream} that will compress data using the LZ4 algorithm.
@@ -63,21 +94,35 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
      * @param out The output stream to compress
      * @param blockSize Default: 4. The block size used during compression. 4=64kb, 5=256kb, 6=1mb, 7=4mb. All other
      *            values will generate an exception
-     * @param blockChecksum Default: false. When true, a XXHash32 checksum is computed and appended to the stream for
-     *            every block of data
+     * @param bits A set of features to use
      * @throws IOException
      */
-    public KafkaLZ4BlockOutputStream(OutputStream out, int blockSize, boolean blockChecksum) throws IOException {
+    public KafkaLZ4BlockOutputStream(OutputStream out, BLOCKSIZE blockSize, FLG.Bits... bits) throws IOException {
+        this(out, blockSize, -1L, bits);
+    }
+
+    /**
+     * Create a new {@link OutputStream} that will compress data using the LZ4 algorithm.
+     *
+     * @param out The output stream to compress
+     * @param blockSize Default: 4. The block size used during compression. 4=64kb, 5=256kb, 6=1mb, 7=4mb. All other
+     *            values will generate an exception
+     * @param bits A set of features to use
+     * @param knownSize The size of the uncompressed data. A value less than zero means unknown.
+     * @throws IOException
+     */
+    public KafkaLZ4BlockOutputStream(OutputStream out, BLOCKSIZE blockSize, long knownSize, FLG.Bits... bits) throws IOException {
         super(out);
         compressor = LZ4Factory.fastestInstance().fastCompressor();
         checksum = XXHashFactory.fastestInstance().hash32();
-        bd = new BD(blockSize);
-        flg = new FLG(blockChecksum);
-        bufferOffset = 0;
-        maxBlockSize = bd.getBlockMaximumSize();
-        buffer = new byte[maxBlockSize];
+        frameInfo = new FrameInfo(new FLG(FLG.DEFAULT_VERSION, bits), new BD(blockSize));
+        maxBlockSize = frameInfo.getBD().getBlockMaximumSize();
+        buffer = ByteBuffer.allocate(maxBlockSize).order(ByteOrder.LITTLE_ENDIAN);
         compressedBuffer = new byte[compressor.maxCompressedLength(maxBlockSize)];
-        finished = false;
+        if(frameInfo.getFLG().isEnabled(FLG.Bits.CONTENT_SIZE) && knownSize < 0){
+            throw new IllegalArgumentException("Known size must be greater than zero in order to use the known size feature");
+        }
+        this.knownSize = knownSize;
         writeHeader();
     }
 
@@ -89,8 +134,8 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
      *            values will generate an exception
      * @throws IOException
      */
-    public KafkaLZ4BlockOutputStream(OutputStream out, int blockSize) throws IOException {
-        this(out, blockSize, false);
+    public KafkaLZ4BlockOutputStream(OutputStream out, BLOCKSIZE blockSize) throws IOException {
+        this(out, blockSize, DEFAULT_FEATURES);
     }
 
     /**
@@ -100,7 +145,7 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
      * @throws IOException
      */
     public KafkaLZ4BlockOutputStream(OutputStream out) throws IOException {
-        this(out, BLOCKSIZE_64KB);
+        this(out, BLOCKSIZE.SIZE_4MB);
     }
 
     /**
@@ -109,20 +154,22 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
      * @throws IOException
      */
     private void writeHeader() throws IOException {
-        Utils.writeUnsignedIntLE(buffer, 0, MAGIC);
-        bufferOffset = 4;
-        buffer[bufferOffset++] = flg.toByte();
-        buffer[bufferOffset++] = bd.toByte();
-        // TODO write uncompressed content size, update flg.validate()
-        // TODO write dictionary id, update flg.validate()
+        final ByteBuffer headerBuffer = ByteBuffer.allocate(LZ4_MAX_HEADER_LENGTH).order(ByteOrder.LITTLE_ENDIAN);
+        headerBuffer.putInt(MAGIC);
+        headerBuffer.put(frameInfo.getFLG().toByte());
+        headerBuffer.put(frameInfo.getBD().toByte());
+        if(frameInfo.isEnabled(FLG.Bits.CONTENT_SIZE)) {
+            headerBuffer.putLong(knownSize);
+        }
         // compute checksum on all descriptor fields
-        int hash = (checksum.hash(buffer, 0, bufferOffset, 0) >> 8) & 0xFF;
-        buffer[bufferOffset++] = (byte) hash;
+        final int hash = (checksum.hash(headerBuffer.array(), INTEGER_BYTES, headerBuffer.position() - INTEGER_BYTES, 0) >> 8) & 0xFF;
+        headerBuffer.put((byte) hash);
         // write out frame descriptor
-        out.write(buffer, 0, bufferOffset);
-        bufferOffset = 0;
+        out.write(headerBuffer.array(), 0, headerBuffer.position());
     }
 
+
+    private final ByteBuffer intLEBuffer = ByteBuffer.allocate(INTEGER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
     /**
      * Compresses buffered data, optionally computes an XXHash32 checksum, and writes the result to the underlying
      * {@link OutputStream}.
@@ -130,31 +177,37 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
      * @throws IOException
      */
     private void writeBlock() throws IOException {
-        if (bufferOffset == 0) {
+        if (buffer.position() == 0) {
             return;
         }
+        // Make sure there's no stale data
+        Arrays.fill(compressedBuffer, (byte) 0);
 
-        int compressedLength = compressor.compress(buffer, 0, bufferOffset, compressedBuffer, 0);
-        byte[] bufferToWrite = compressedBuffer;
-        int compressMethod = 0;
+        int compressedLength = compressor.compress(buffer.array(), 0, buffer.position(), compressedBuffer, 0);
+        final byte[] bufferToWrite;
+        final int compressMethod;
 
         // Store block uncompressed if compressed length is greater (incompressible)
-        if (compressedLength >= bufferOffset) {
-            bufferToWrite = buffer;
-            compressedLength = bufferOffset;
+        if (compressedLength >= buffer.position()) {
+            compressedLength = buffer.position();
+            bufferToWrite = Arrays.copyOf(buffer.array(), compressedLength);
             compressMethod = LZ4_FRAME_INCOMPRESSIBLE_MASK;
+        } else {
+            bufferToWrite = compressedBuffer;
+            compressMethod = 0;
         }
 
         // Write content
-        Utils.writeUnsignedIntLE(out, compressedLength | compressMethod);
+        intLEBuffer.putInt(0, compressedLength | compressMethod);
+        out.write(intLEBuffer.array());
         out.write(bufferToWrite, 0, compressedLength);
 
         // Calculate and write block checksum
-        if (flg.isBlockChecksumSet()) {
-            int hash = checksum.hash(bufferToWrite, 0, compressedLength, 0);
-            Utils.writeUnsignedIntLE(out, hash);
+        if (frameInfo.isEnabled(FLG.Bits.BLOCK_CHECKSUM)) {
+            intLEBuffer.putInt(0, checksum.hash(bufferToWrite, 0, compressedLength, 0));
+            out.write(intLEBuffer.array());
         }
-        bufferOffset = 0;
+        buffer.rewind();
     }
 
     /**
@@ -164,18 +217,26 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
      * @throws IOException
      */
     private void writeEndMark() throws IOException {
-        Utils.writeUnsignedIntLE(out, 0);
-        // TODO implement content checksum, update flg.validate()
-        finished = true;
+        intLEBuffer.putInt(0, 0);
+        out.write(intLEBuffer.array());
+        if(frameInfo.isEnabled(FLG.Bits.CONTENT_CHECKSUM)){
+            intLEBuffer.putInt(0, frameInfo.currentStreamHash());
+            out.write(intLEBuffer.array());
+        }
+        frameInfo.finish();
     }
 
     @Override
     public void write(int b) throws IOException {
         ensureNotFinished();
-        if (bufferOffset == maxBlockSize) {
+        if (buffer.position() == maxBlockSize) {
             writeBlock();
         }
-        buffer[bufferOffset++] = (byte) b;
+        buffer.put((byte)b);
+
+        if(frameInfo.isEnabled(FLG.Bits.CONTENT_CHECKSUM)) {
+            frameInfo.updateStreamHash(new byte[]{(byte) b}, 0, 1);
+        }
     }
 
     @Override
@@ -183,154 +244,114 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
         net.jpountz.util.Utils.checkRange(b, off, len);
         ensureNotFinished();
 
-        int bufferRemainingLength = maxBlockSize - bufferOffset;
         // while b will fill the buffer
-        while (len > bufferRemainingLength) {
+        while (len > buffer.remaining()) {
+            int sizeWritten = buffer.remaining();
             // fill remaining space in buffer
-            System.arraycopy(b, off, buffer, bufferOffset, bufferRemainingLength);
-            bufferOffset = maxBlockSize;
+            buffer.put(b, off, sizeWritten);
+            if(frameInfo.isEnabled(FLG.Bits.CONTENT_CHECKSUM)) {
+                frameInfo.updateStreamHash(b, off, sizeWritten);
+            }
             writeBlock();
             // compute new offset and length
-            off += bufferRemainingLength;
-            len -= bufferRemainingLength;
-            bufferRemainingLength = maxBlockSize;
+            off += sizeWritten;
+            len -= sizeWritten;
         }
+        buffer.put(b, off, len);
 
-        System.arraycopy(b, off, buffer, bufferOffset, len);
-        bufferOffset += len;
+        if(frameInfo.isEnabled(FLG.Bits.CONTENT_CHECKSUM)) {
+            frameInfo.updateStreamHash(b, off, len);
+        }
     }
 
     @Override
     public void flush() throws IOException {
-        if (!finished) {
+        if (!frameInfo.isFinished()) {
             writeBlock();
         }
-        if (out != null) {
-            out.flush();
-        }
+        super.flush();
     }
 
     /**
      * A simple state check to ensure the stream is still open.
      */
     private void ensureNotFinished() {
-        if (finished) {
+        if (frameInfo.isFinished()) {
             throw new IllegalStateException(CLOSED_STREAM);
         }
     }
 
     @Override
     public void close() throws IOException {
-        if (!finished) {
+        if (!frameInfo.isFinished()) {
             writeEndMark();
             flush();
-            finished = true;
+            frameInfo.finish();
         }
-        if (out != null) {
-            out.close();
-            out = null;
-        }
+        super.close();
     }
 
     public static class FLG {
+        private static final int DEFAULT_VERSION = 1;
 
-        private static final int VERSION = 1;
-
-        private final int presetDictionary;
-        private final int reserved1;
-        private final int contentChecksum;
-        private final int contentSize;
-        private final int blockChecksum;
-        private final int blockIndependence;
+        private final BitSet bitSet;
         private final int version;
 
-        public FLG() {
-            this(false);
-        }
+        public enum Bits{
+            RESERVED_0(0),
+            RESERVED_1(1),
+            CONTENT_CHECKSUM(2),
+            CONTENT_SIZE(3),
+            BLOCK_CHECKSUM(4),
+            BLOCK_INDEPENDENCE(5);
 
-        public FLG(boolean blockChecksum) {
-            this(0, 0, 0, 0, blockChecksum ? 1 : 0, 1, VERSION);
+            private final int position;
+            Bits(int position){
+                this.position = position;
+            }
         }
-
-        private FLG(int presetDictionary,
-                    int reserved1,
-                    int contentChecksum,
-                    int contentSize,
-                    int blockChecksum,
-                    int blockIndependence,
-                    int version) {
-            this.presetDictionary = presetDictionary;
-            this.reserved1 = reserved1;
-            this.contentChecksum = contentChecksum;
-            this.contentSize = contentSize;
-            this.blockChecksum = blockChecksum;
-            this.blockIndependence = blockIndependence;
+        public FLG(int version, Bits... bits){
+            this.bitSet = new BitSet(8);
+            this.version = version;
+            if(bits != null){
+                for(Bits bit : bits){
+                    bitSet.set(bit.position);
+                }
+            }
+            validate();
+        }
+        private FLG(int version, byte b){
+            this.bitSet = BitSet.valueOf(new byte[]{b});
             this.version = version;
             validate();
         }
 
         public static FLG fromByte(byte flg) {
-            int presetDictionary = (flg >>> 0) & 1;
-            int reserved1 = (flg >>> 1) & 1;
-            int contentChecksum = (flg >>> 2) & 1;
-            int contentSize = (flg >>> 3) & 1;
-            int blockChecksum = (flg >>> 4) & 1;
-            int blockIndependence = (flg >>> 5) & 1;
-            int version = (flg >>> 6) & 3;
-
-            return new FLG(presetDictionary,
-                           reserved1,
-                           contentChecksum,
-                           contentSize,
-                           blockChecksum,
-                           blockIndependence,
-                           version);
+            final byte versionMask = (byte)(flg & (3<<6));
+            return new FLG(versionMask >>> 6, (byte) (flg ^ versionMask));
         }
 
         public byte toByte() {
-            return (byte) (((presetDictionary & 1) << 0) | ((reserved1 & 1) << 1) | ((contentChecksum & 1) << 2)
-                    | ((contentSize & 1) << 3) | ((blockChecksum & 1) << 4) | ((blockIndependence & 1) << 5) | ((version & 3) << 6));
+            return (byte)(bitSet.toByteArray()[0] | ((version & 3) << 6));
         }
 
         private void validate() {
-            if (presetDictionary != 0) {
-                throw new RuntimeException("Preset dictionary is unsupported");
+            if (bitSet.get(Bits.RESERVED_0.position)) {
+                throw new RuntimeException("Reserved0 field must be 0");
             }
-            if (reserved1 != 0) {
+            if (bitSet.get(Bits.RESERVED_1.position)) {
                 throw new RuntimeException("Reserved1 field must be 0");
             }
-            if (contentChecksum != 0) {
-                throw new RuntimeException("Content checksum is unsupported");
-            }
-            if (contentSize != 0) {
-                throw new RuntimeException("Content size is unsupported");
-            }
-            if (blockIndependence != 1) {
+            if (!bitSet.get(Bits.BLOCK_INDEPENDENCE.position)) {
                 throw new RuntimeException("Dependent block stream is unsupported");
             }
-            if (version != VERSION) {
+            if (version != DEFAULT_VERSION) {
                 throw new RuntimeException(String.format("Version %d is unsupported", version));
             }
         }
 
-        public boolean isPresetDictionarySet() {
-            return presetDictionary == 1;
-        }
-
-        public boolean isContentChecksumSet() {
-            return contentChecksum == 1;
-        }
-
-        public boolean isContentSizeSet() {
-            return contentSize == 1;
-        }
-
-        public boolean isBlockChecksumSet() {
-            return blockChecksum == 1;
-        }
-
-        public boolean isBlockIndependenceSet() {
-            return blockIndependence == 1;
+        public boolean isEnabled(Bits bit){
+            return bitSet.get(bit.position);
         }
 
         public int getVersion() {
@@ -339,54 +360,63 @@ public final class KafkaLZ4BlockOutputStream extends FilterOutputStream {
     }
 
     public static class BD {
+        private static final int RESERVED_MASK = 0x8F;
 
-        private final int reserved2;
-        private final int blockSizeValue;
-        private final int reserved3;
+        private final BLOCKSIZE blockSizeValue;
 
-        public BD() {
-            this(0, BLOCKSIZE_64KB, 0);
-        }
-
-        public BD(int blockSizeValue) {
-            this(0, blockSizeValue, 0);
-        }
-
-        private BD(int reserved2, int blockSizeValue, int reserved3) {
-            this.reserved2 = reserved2;
+        private BD(BLOCKSIZE blockSizeValue) {
             this.blockSizeValue = blockSizeValue;
-            this.reserved3 = reserved3;
-            validate();
         }
 
         public static BD fromByte(byte bd) {
-            int reserved2 = (bd >>> 0) & 15;
             int blockMaximumSize = (bd >>> 4) & 7;
-            int reserved3 = (bd >>> 7) & 1;
+            if((bd & RESERVED_MASK) > 0){
+                throw new RuntimeException("Reserved fields must be 0");
+            }
 
-            return new BD(reserved2, blockMaximumSize, reserved3);
-        }
-
-        private void validate() {
-            if (reserved2 != 0) {
-                throw new RuntimeException("Reserved2 field must be 0");
-            }
-            if (blockSizeValue < 4 || blockSizeValue > 7) {
-                throw new RuntimeException("Block size value must be between 4 and 7");
-            }
-            if (reserved3 != 0) {
-                throw new RuntimeException("Reserved3 field must be 0");
-            }
+            return new BD(BLOCKSIZE.valueOf(blockMaximumSize));
         }
 
         // 2^(2n+8)
         public int getBlockMaximumSize() {
-            return 1 << ((2 * blockSizeValue) + 8);
+            return 1 << ((2 * blockSizeValue.getIndicator()) + 8);
         }
 
         public byte toByte() {
-            return (byte) (((reserved2 & 15) << 0) | ((blockSizeValue & 7) << 4) | ((reserved3 & 1) << 7));
+            return (byte) ((blockSizeValue.getIndicator() & 7) << 4);
         }
     }
 
+    public static class FrameInfo{
+        private final FLG flg;
+        private final BD bd;
+        private final StreamingXXHash32 streamHash;
+        private boolean finished = false;
+        public FrameInfo(FLG flg, BD bd){
+            this.flg = flg;
+            this.bd = bd;
+            this.streamHash = flg.isEnabled(FLG.Bits.CONTENT_CHECKSUM) ? XXHashFactory.fastestInstance().newStreamingHash32(0) : null;
+        }
+        public boolean isEnabled(FLG.Bits bit){
+            return flg.isEnabled(bit);
+        }
+        public FLG getFLG(){
+            return this.flg;
+        }
+        public BD getBD(){
+            return this.bd;
+        }
+        public void updateStreamHash(byte[] buff, int off, int len){
+            this.streamHash.update(buff, off, len);
+        }
+        public int currentStreamHash(){
+            return this.streamHash.getValue();
+        }
+        public void finish(){
+            this.finished = true;
+        }
+        public boolean isFinished(){
+            return this.finished;
+        }
+    }
 }

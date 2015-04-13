@@ -17,6 +17,8 @@
 
 package org.apache.kafka.common.record;
 
+import static org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.INTEGER_BYTES;
+import static org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.LONG_BYTES;
 import static org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.LZ4_FRAME_INCOMPRESSIBLE_MASK;
 import static org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.LZ4_MAX_HEADER_LENGTH;
 import static org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.MAGIC;
@@ -24,10 +26,11 @@ import static org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.MAGIC;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.BD;
 import org.apache.kafka.common.record.KafkaLZ4BlockOutputStream.FLG;
-import org.apache.kafka.common.utils.Utils;
 
 import net.jpountz.lz4.LZ4Exception;
 import net.jpountz.lz4.LZ4Factory;
@@ -36,10 +39,13 @@ import net.jpountz.xxhash.XXHash32;
 import net.jpountz.xxhash.XXHashFactory;
 
 /**
- * A partial implementation of the v1.4.1 LZ4 Frame format.
+ * A partial implementation of the v1.5.0 LZ4 Frame format. This class is NOT thread safe
+ * Not Supported:
+ * * Dependent blocks
+ * * Legacy streams
  * 
- * @see <a href="https://docs.google.com/document/d/1Tdxmn5_2e5p1y4PtXkatLndWVb0R8QARJFe6JI4Keuo/edit">LZ4 Framing
- *      Format Spec</a>
+ * @see <a href="https://docs.google.com/document/d/1cl8N1bmkTdIpPLtnlzbBSFAdUeyNo5fwfHbHU7VRNWY">LZ4 Framing
+ *      Format Spec 1.5.0</a>
  */
 public final class KafkaLZ4BlockInputStream extends FilterInputStream {
 
@@ -47,17 +53,20 @@ public final class KafkaLZ4BlockInputStream extends FilterInputStream {
     public static final String NOT_SUPPORTED = "Stream unsupported";
     public static final String BLOCK_HASH_MISMATCH = "Block checksum mismatch";
     public static final String DESCRIPTOR_HASH_MISMATCH = "Stream frame descriptor corrupted";
+    public static final int MAGIC_SKIPPABLE_BASE = 0x184D2A50;
 
     private final LZ4SafeDecompressor decompressor;
     private final XXHash32 checksum;
-    private final byte[] buffer;
-    private final byte[] compressedBuffer;
-    private final int maxBlockSize;
-    private FLG flg;
-    private BD bd;
-    private int bufferOffset;
-    private int bufferSize;
-    private boolean finished;
+    private final byte[] headerArray = new byte[LZ4_MAX_HEADER_LENGTH];
+    private final ByteBuffer headerBuffer = ByteBuffer.wrap(headerArray).order(ByteOrder.LITTLE_ENDIAN);
+    private byte[] compressedBuffer;
+    private ByteBuffer buffer = null;
+    private byte[] rawBuffer = null;
+    private int maxBlockSize = -1;
+    private long expectedContentSize = -1L;
+    private long totalContentSize = 0L;
+
+    private KafkaLZ4BlockOutputStream.FrameInfo frameInfo = null;
 
     /**
      * Create a new {@link InputStream} that will decompress data using the LZ4 algorithm.
@@ -69,45 +78,125 @@ public final class KafkaLZ4BlockInputStream extends FilterInputStream {
         super(in);
         decompressor = LZ4Factory.fastestInstance().safeDecompressor();
         checksum = XXHashFactory.fastestInstance().hash32();
-        readHeader();
-        maxBlockSize = bd.getBlockMaximumSize();
-        buffer = new byte[maxBlockSize];
-        compressedBuffer = new byte[maxBlockSize];
-        bufferOffset = 0;
-        bufferSize = 0;
-        finished = false;
+        nextFrameInfo();
+    }
+
+
+    /**
+     * Try and load in the next valid frame info. This will skip over skippable frames.
+     * @return True if a frame was loaded. False if there are no more frames in the stream.
+     * @throws IOException On input stream read exception
+     */
+    private boolean nextFrameInfo() throws IOException
+    {
+        int size = 0;
+        do {
+            final int mySize = in.read(readNumberBuff.array(), size, INTEGER_BYTES - size);
+            if(mySize < 0){
+                return false;
+            }
+            size += mySize;
+        }while(size < INTEGER_BYTES);
+        final int magic = readNumberBuff.getInt(0);
+        if(magic == MAGIC){
+            readHeader();
+            return true;
+        } else if ((magic >>> 8) == (MAGIC_SKIPPABLE_BASE>>>8)){
+            skippableFrame();
+            return nextFrameInfo();
+        } else {
+            throw new IOException(NOT_SUPPORTED);
+        }
+    }
+
+    private void skippableFrame() throws IOException
+    {
+        int skipSize = readInt(in);
+        final byte[] skipBuffer = new byte[1<<10];
+        while(skipSize > 0){
+            final int mySize = in.read(skipBuffer, 0, Math.min(skipSize, skipBuffer.length));
+            if(mySize < 0){
+                throw new IOException(PREMATURE_EOS);
+            }
+            skipSize -= mySize;
+        }
     }
 
     /**
-     * Reads the magic number and frame descriptor from the underlying {@link InputStream}.
+     * Reads the frame descriptor from the underlying {@link InputStream}.
      * 
      * @throws IOException
      */
     private void readHeader() throws IOException {
-        byte[] header = new byte[LZ4_MAX_HEADER_LENGTH];
+        headerBuffer.rewind();
 
-        // read first 6 bytes into buffer to check magic and FLG/BD descriptor flags
-        bufferOffset = 6;
-        if (in.read(header, 0, bufferOffset) != bufferOffset) {
+        final int flgRead = in.read();
+        if(flgRead < 0){
+            throw new IOException(PREMATURE_EOS);
+        }
+        final int bdRead = in.read();
+        if(bdRead < 0){
             throw new IOException(PREMATURE_EOS);
         }
 
-        if (MAGIC != Utils.readUnsignedIntLE(header, bufferOffset - 6)) {
-            throw new IOException(NOT_SUPPORTED);
+        final byte flgByte = (byte)(flgRead & 0xFF);
+        final FLG flg = FLG.fromByte(flgByte);
+        headerBuffer.put(flgByte);
+        final byte bdByte = (byte)(bdRead & 0xFF);
+        final BD bd = BD.fromByte(bdByte);
+        headerBuffer.put(bdByte);
+
+        this.frameInfo = new KafkaLZ4BlockOutputStream.FrameInfo(flg, bd);
+
+        if(flg.isEnabled(FLG.Bits.CONTENT_SIZE)){
+            expectedContentSize = readLong(in);
+            headerBuffer.putLong(expectedContentSize);
         }
-        flg = FLG.fromByte(header[bufferOffset - 2]);
-        bd = BD.fromByte(header[bufferOffset - 1]);
-        // TODO read uncompressed content size, update flg.validate()
-        // TODO read dictionary id, update flg.validate()
 
         // check stream descriptor hash
-        byte hash = (byte) ((checksum.hash(header, 0, bufferOffset, 0) >> 8) & 0xFF);
-        header[bufferOffset++] = (byte) in.read();
-        if (hash != header[bufferOffset - 1]) {
+        final byte hash = (byte) ((checksum.hash(headerArray, 0, headerBuffer.position(), 0) >> 8) & 0xFF);
+        final int expectedHash = in.read();
+        if(expectedHash < 0){
+            throw new IOException(PREMATURE_EOS);
+        }
+
+        if (hash != (byte)(expectedHash & 0xFF)) {
             throw new IOException(DESCRIPTOR_HASH_MISMATCH);
         }
+
+        maxBlockSize = frameInfo.getBD().getBlockMaximumSize();
+        compressedBuffer = new byte[maxBlockSize]; // Reused during different compressions
+        rawBuffer = new byte[maxBlockSize];
+        buffer = ByteBuffer.wrap(rawBuffer);
+        buffer.limit(0);
     }
 
+    private final ByteBuffer readNumberBuff = ByteBuffer.allocate(LONG_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+
+    private long readLong(InputStream stream) throws IOException
+    {
+        int offset = 0;
+        do{
+            final int mySize = stream.read(readNumberBuff.array(), offset, LONG_BYTES - offset);
+            if(mySize < 0){
+                throw new IOException(PREMATURE_EOS);
+            }
+            offset += mySize;
+        }while(offset < LONG_BYTES);
+        return readNumberBuff.getInt(0);
+    }
+    private int readInt(InputStream stream) throws IOException
+    {
+        int offset = 0;
+        do{
+            final int mySize = stream.read(readNumberBuff.array(), offset, INTEGER_BYTES - offset);
+            if(mySize < 0){
+                throw new IOException(PREMATURE_EOS);
+            }
+            offset += mySize;
+        }while(offset < INTEGER_BYTES);
+        return readNumberBuff.getInt(0);
+    }
     /**
      * Decompresses (if necessary) buffered data, optionally computes and validates a XXHash32 checksum, and writes the
      * result to a buffer.
@@ -115,115 +204,141 @@ public final class KafkaLZ4BlockInputStream extends FilterInputStream {
      * @throws IOException
      */
     private void readBlock() throws IOException {
-        int blockSize = Utils.readUnsignedIntLE(in);
+        int blockSize = readInt(in);
 
         // Check for EndMark
         if (blockSize == 0) {
-            finished = true;
-            // TODO implement content checksum, update flg.validate()
+            if(frameInfo.isEnabled(FLG.Bits.CONTENT_CHECKSUM)){
+                final int contentChecksum = readInt(in);
+                if(contentChecksum != frameInfo.currentStreamHash()){
+                    throw new IOException("Content checksum mismatch");
+                }
+            }
+            frameInfo.finish();
             return;
-        } else if (blockSize > maxBlockSize) {
+        }
+
+        final boolean compressed = (blockSize & LZ4_FRAME_INCOMPRESSIBLE_MASK) == 0;
+        final byte[] tmpBuffer; // Use a temporary buffer, potentially one used for compression
+        if (compressed) {
+            tmpBuffer = compressedBuffer;
+        }else {
+            tmpBuffer = rawBuffer;
+            blockSize ^= LZ4_FRAME_INCOMPRESSIBLE_MASK;
+        }
+        if (blockSize > maxBlockSize) {
             throw new IOException(String.format("Block size %s exceeded max: %s", blockSize, maxBlockSize));
         }
 
-        boolean compressed = (blockSize & LZ4_FRAME_INCOMPRESSIBLE_MASK) == 0;
-        byte[] bufferToRead;
-        if (compressed) {
-            bufferToRead = compressedBuffer;
-        } else {
-            blockSize &= ~LZ4_FRAME_INCOMPRESSIBLE_MASK;
-            bufferToRead = buffer;
-            bufferSize = blockSize;
+        int offset = 0;
+        while(offset < blockSize){
+            final int lastRead = in.read(tmpBuffer, offset, blockSize - offset);
+            if(lastRead < 0){
+                throw new IOException(PREMATURE_EOS);
+            }
+            offset += lastRead;
         }
 
-        if (in.read(bufferToRead, 0, blockSize) != blockSize) {
-            throw new IOException(PREMATURE_EOS);
-        }
-
-        // verify checksum
-        if (flg.isBlockChecksumSet() && Utils.readUnsignedIntLE(in) != checksum.hash(bufferToRead, 0, blockSize, 0)) {
-            throw new IOException(BLOCK_HASH_MISMATCH);
-        }
-
-        if (compressed) {
-            try {
-                bufferSize = decompressor.decompress(compressedBuffer, 0, blockSize, buffer, 0, maxBlockSize);
-            } catch (LZ4Exception e) {
-                throw new IOException(e);
+        // verify block checksum
+        if (frameInfo.isEnabled(FLG.Bits.BLOCK_CHECKSUM)){
+            final int hashCheck = readInt(in);
+            if(hashCheck != checksum.hash(tmpBuffer, 0, blockSize, 0)){
+                throw new IOException(BLOCK_HASH_MISMATCH);
             }
         }
 
-        bufferOffset = 0;
+
+        final int currentBufferSize;
+        if (compressed) {
+            try {
+                currentBufferSize = decompressor.decompress(tmpBuffer, 0, blockSize, rawBuffer, 0, rawBuffer.length);
+            } catch (LZ4Exception e) {
+                throw new IOException(e);
+            }
+        } else {
+            currentBufferSize = blockSize;
+        }
+        if(frameInfo.isEnabled(FLG.Bits.CONTENT_CHECKSUM)) {
+            frameInfo.updateStreamHash(rawBuffer, 0, currentBufferSize);
+        }
+        totalContentSize += currentBufferSize;
+        buffer.limit(currentBufferSize);
+        buffer.rewind();
     }
 
     @Override
     public int read() throws IOException {
-        if (finished) {
-            return -1;
+        if (frameInfo.isFinished()) {
+            if(!nextFrameInfo()) {
+                return -1;
+            }
         }
-        if (available() == 0) {
+        if (buffer.remaining() == 0) {
             readBlock();
         }
-        if (finished) {
-            return -1;
+        if (frameInfo.isFinished()) {
+            return read();
         }
-        int value = buffer[bufferOffset++] & 0xFF;
 
-        return value;
+        return buffer.get();
     }
 
     @Override
     public int read(byte[] b, int off, int len) throws IOException {
         net.jpountz.util.Utils.checkRange(b, off, len);
-        if (finished) {
-            return -1;
+        if (frameInfo.isFinished()) {
+            if(!nextFrameInfo()) {
+                return -1;
+            }
         }
-        if (available() == 0) {
+        if (buffer.remaining() == 0) {
             readBlock();
         }
-        if (finished) {
-            return -1;
+        if (frameInfo.isFinished()) {
+            return read(b, off, len);
         }
-        len = Math.min(len, available());
-        System.arraycopy(buffer, bufferOffset, b, off, len);
-        bufferOffset += len;
+        len = Math.min(len, buffer.remaining());
+        buffer.get(b, off, len);
         return len;
     }
 
     @Override
     public long skip(long n) throws IOException {
-        if (finished) {
+        if (frameInfo.isFinished()) {
             return 0;
         }
         if (available() == 0) {
             readBlock();
         }
-        if (finished) {
+        if (frameInfo.isFinished()) {
             return 0;
         }
-        n = Math.min(n, available());
-        bufferOffset += n;
+        n = Math.min(n, buffer.remaining());
+        buffer.position(buffer.position() + (int)n);
         return n;
     }
 
     @Override
     public int available() throws IOException {
-        return bufferSize - bufferOffset;
+        return buffer.remaining();
     }
 
     @Override
     public void close() throws IOException {
-        in.close();
+        super.close();
+        if(frameInfo.isEnabled(FLG.Bits.CONTENT_SIZE) && expectedContentSize != totalContentSize){
+            throw new IOException("Size check mismatch");
+        }
     }
 
     @Override
     public synchronized void mark(int readlimit) {
-        throw new RuntimeException("mark not supported");
+        throw new UnsupportedOperationException("mark not supported");
     }
 
     @Override
     public synchronized void reset() throws IOException {
-        throw new RuntimeException("reset not supported");
+        throw new UnsupportedOperationException("reset not supported");
     }
 
     @Override
